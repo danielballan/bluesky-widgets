@@ -34,16 +34,7 @@ class DataLoader(QThread):
     """
 
     def __init__(self, queue, get_data, data, data_changed, *args, **kwargs):
-        # Because the run method contains an infinite loop (standing by to
-        # receive work when additional rows are fetched or when the
-        # results catalog is refreshed) stopping it requires a special pattern.
-        #
-        # Note that parent=None here. If we make the parent the
-        # _SearchResultsModel, it will kill this thread immediately after it
-        # fires the `destroyed` signal, which does not give us time to process
-        # that `destroyed` signal and notice that an interruption has been
-        # requested before we are killed.
-        super().__init__(*args, parent=None, **kwargs)
+        super().__init__(*args, **kwargs)
         self._queue = queue
         self._get_data = get_data
         self._data = data
@@ -106,15 +97,29 @@ class _SearchResultsModel(QAbstractTableModel):
         self._data = {}
         self._request_queue = queue.Queue()
         self._data_loader = DataLoader(
-            self._request_queue, self.model.get_data, self._data, self.dataChanged
+            self._request_queue,
+            self.model.get_data,
+            self._data,
+            self.dataChanged,
+            parent=self,
         )
         # The DataLoader thread is not started here. It will be started if/when
         # we need it for the first time.
-        self.destroyed.connect(self._data_loader.requestInterruption)
+        self.destroyed.connect(self._stop_data_loader, Qt.BlockingQueuedConnection)
 
         # Changes to the model update the GUI.
         self.model.events.begin_reset.connect(self.on_begin_reset)
         self.model.events.end_reset.connect(self.on_end_reset)
+
+    def requestInterruption(self):
+        logger.debug("DataLoader shutdown requested")
+        return super().requestInterruption()
+
+    def _stop_data_loader(self):
+        self._data_loader.requestInterruption()
+        # Wait for the polling loop in DataLoader to process the interruption
+        # request.
+        self._data_loader.wait()
 
     def _fetch_data(self, index):
         """Kick off a request to fetch the data"""
