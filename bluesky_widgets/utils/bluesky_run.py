@@ -1,4 +1,6 @@
 import collections
+import collections.abc
+import itertools
 from datetime import datetime
 import functools
 
@@ -17,8 +19,13 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
         self.start_doc = None
         self.stop_doc = None
         self.events = EmitterGroup(new_stream=Event, new_data=Event, completed=Event)
-        self._stream_names = set()
+        # maps stream name to list of descriptors
+        self._streams = {}
         self._ordered = []
+
+    @property
+    def streams(self):
+        return self._streams
 
     def start(self, doc):
         self.start_doc = doc
@@ -44,9 +51,11 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
         name = doc.get("name")  # Might be missing in old documents
         self.descriptors[doc["uid"]] = doc
         self._ordered.append(doc)
-        if name is not None and name not in self._stream_names:
-            self._stream_names.add(name)
-            self.events.new_stream(name)
+        if name is not None and name not in self._streams:
+            self._streams[name] = [doc]
+            self.events.new_stream(name=name)
+        else:
+            self._streams[name].append(doc)
 
     def resource(self, doc):
         self.resources[doc["uid"]] = doc
@@ -57,7 +66,7 @@ class StreamExists(event_model.EventModelRuntimeError):
     ...
 
 
-class RunBuilder:
+class RunBuilder(collections.abc.Mapping):
     def __init__(self, metadata=None, uid=None, time=None):
         self._cache = DocumentCache()
         self._run_bundle = event_model.compose_run(
@@ -67,7 +76,21 @@ class RunBuilder:
         # maps stream name to StreamBuilder
         self._streams = {}
 
+    # The following three methods are required to implement the Mapping interface.
+
+    def __getitem__(self, key):
+        return self._streams[key]
+
+    def __len__(self):
+        return len(self._streams)
+
+    def __iter__(self):
+        yield from self._streams
+
     def __getattr__(self, key):
+        # Allow dot access for any stream names, as long as they are (of
+        # course) valid Python identifiers and do not collide with existing
+        # method names.
         try:
             return self._streams[key]
         except KeyError:
@@ -176,7 +199,7 @@ class StreamBuilder:
         self._closed = True
 
 
-class BlueskyRun:
+class BlueskyRun(collections.abc.Mapping):
     """
     Push-based BlueskyRun
     """
@@ -219,24 +242,67 @@ class BlueskyRun:
         self.metadata = {
             "start": Start(self._transforms["start"](document_cache.start_doc))
         }
+
+        # Wire up notification for when 'stop' doc is emitted or add it now if
+        # it is already present.
         if self._document_cache.stop_doc is None:
             self.metadata["stop"] = None
+
+            def on_completed(event):
+                self.metadata["stop"] = Stop(
+                    self._transforms["stop"](self._document_cache.stop_doc)
+                )
+
+            self._document_cache.events.completed.connect(on_completed)
         else:
             self.metadata["stop"] = Stop(
                 self._transforms["stop"](self._document_cache.stop_doc)
             )
 
-        def on_completed(event):
-            self.metadata["stop"] = Stop(
-                self._transforms["stop"](self._document_cache.stop_doc)
+        # Create any streams already present.
+        for name in document_cache.streams:
+            stream = BlueskyEventStream(
+                name, document_cache, self._get_filler, self._transforms["descriptor"]
             )
+            self._streams[name] = stream
 
-        self._document_cache.events.completed.connect(on_completed)
+        # ...and wire up notification for future ones.
+
+        def on_new_stream(event):
+            stream = BlueskyEventStream(
+                event.name,
+                document_cache,
+                self._get_filler,
+                self._transforms["descriptor"],
+            )
+            self._streams[event.name] = stream
+
+        self._document_cache.events.new_stream.connect(on_new_stream)
+
+    # The following three methods are required to implement the Mapping interface.
+
+    def __getitem__(self, key):
+        return self._streams[key]
+
+    def __len__(self):
+        return len(self._streams)
 
     def __iter__(self):
-        yield from self._streams.items()
+        yield from self._streams
+
+    def __getattr__(self, key):
+        # Allow dot access for any stream names, as long as they are (of
+        # course) valid Python identifiers and do not collide with existing
+        # method names.
+        try:
+            return self._streams[key]
+        except KeyError:
+            raise AttributeError(key)
 
     def __repr__(self):
+        # This is intentially a *single-line* string, suitable for placing in
+        # logs. See _repr_pretty_ for a string better suited to interactive
+        # computing.
         try:
             start = self.metadata["start"]
             return f"<{self.__class__.__name__} uid={start['uid']!r}>"
@@ -244,6 +310,8 @@ class BlueskyRun:
             return f"<{self.__class__.__name__} *REPR RENDERING FAILURE* {exc!r}>"
 
     def _repr_pretty_(self, p, cycle):
+        # This hook is used by IPython. It provides a multi-line string more
+        # detailed than __repr__, suitable for interactive computing.
         try:
             start = self.metadata["start"]
             stop = self.metadata["stop"] or {}
@@ -266,8 +334,20 @@ class BlueskyRun:
 
 
 class BlueskyEventStream:
-    def __init__(self, stream_name, document_cache, get_filler):
-        ...
+    def __init__(self, stream_name, document_cache, get_filler, transform):
+        self._stream_name = stream_name
+        self._document_cache = document_cache
+        self._get_filler = get_filler
+        self._transform = transform
+
+    @property
+    def _descriptors(self):
+        from databroker.core import Descriptor
+
+        return [
+            Descriptor(self._transform(descriptor))
+            for descriptor in self._document_cache.streams[self._stream_name]
+        ]
 
     def to_dask(self):
 
@@ -288,15 +368,15 @@ class BlueskyEventStream:
         # def get_resources():
         #     return list(document_cache.resources.values())
 
-        # def lookup_resource_for_datum(datum_id):
-        #     return document_cache.resource_uid_by_datum_id[datum_id]
+        def lookup_resource_for_datum(datum_id):
+            return document_cache.resource_uid_by_datum_id[datum_id]
 
         def get_datum_pages(resource_uid, skip=0, limit=None):
             if skip != 0 and limit is not None:
                 raise NotImplementedError
             return document_cache.datum_pages_by_resource[resource_uid]
 
-        filler = get_filler(coerce="delayed")
+        filler = self._get_filler(coerce="delayed")
 
         ds = _documents_to_xarray(
             start_doc=document_cache.start_doc,
@@ -360,6 +440,9 @@ def _documents_to_xarray(
     -------
     dataset : xarray.Dataset
     """
+    import numpy
+    import xarray
+
     if include is None:
         include = []
     if exclude is None:
@@ -495,3 +578,119 @@ def _ft(timestamp):
         return timestamp
     # Truncate microseconds to miliseconds. Do not bother to round.
     return (datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f"))[:-3]
+
+
+def _flatten_event_page_gen(gen):
+    """
+    Converts an event_page generator to an event generator.
+
+    Parameters
+    ----------
+    gen : generator
+
+    Returns
+    -------
+    event_generator : generator
+    """
+    for page in gen:
+        yield from event_model.unpack_event_page(page)
+
+
+def _fill(filler,
+          event,
+          lookup_resource_for_datum,
+          get_resource,
+          get_datum_pages,
+          last_datum_id=None):
+    try:
+        _, filled_event = filler("event", event)
+        return filled_event
+    except event_model.UnresolvableForeignKeyError as err:
+        datum_id = err.key
+        if datum_id == last_datum_id:
+            # We tried to fetch this Datum on the last trip
+            # trip through this method, and apparently it did not
+            # work. We are in an infinite loop. Bail!
+            raise
+
+        # try to fast-path looking up the resource uid if this works
+        # it saves us a a database hit (to get the datum document)
+        if "/" in datum_id:
+            resource_uid, _ = datum_id.split("/", 1)
+        # otherwise do it the standard way
+        else:
+            resource_uid = lookup_resource_for_datum(datum_id)
+
+        # but, it might be the case that the key just happens to have
+        # a '/' in it and it does not have any semantic meaning so we
+        # optimistically try
+        try:
+            resource = get_resource(uid=resource_uid)
+        # and then fall back to the standard way to be safe
+        except ValueError:
+            resource = get_resource(lookup_resource_for_datum(datum_id))
+
+        filler("resource", resource)
+        # Pre-fetch all datum for this resource.
+        for datum_page in get_datum_pages(resource_uid=resource_uid):
+            filler("datum_page", datum_page)
+        # TODO -- When to clear the datum cache in filler?
+
+        # Re-enter and try again now that the Filler has consumed the
+        # missing Datum. There might be another missing Datum in this same
+        # Event document (hence this re-entrant structure) or might be good
+        # to go.
+        return _fill(
+            filler,
+            event,
+            lookup_resource_for_datum,
+            get_resource,
+            get_datum_pages,
+            last_datum_id=datum_id,
+        )
+
+
+def _transpose(in_data, keys, field):
+    """Turn a list of dicts into dict of lists
+
+    Parameters
+    ----------
+    in_data : list
+        A list of dicts which contain at least one dict.
+        All of the inner dicts must have at least the keys
+        in `keys`
+
+    keys : list
+        The list of keys to extract
+
+    field : str
+        The field in the outer dict to use
+
+    Returns
+    -------
+    transpose : dict
+        The transpose of the data
+    """
+    import dask.array
+    import numpy
+
+    out = {k: [None] * len(in_data) for k in keys}
+    for j, ev in enumerate(in_data):
+        dd = ev[field]
+        for k in keys:
+            out[k][j] = dd[k]
+    for k in keys:
+        try:
+            # compatibility with dask < 2
+            if hasattr(out[k][0], 'shape'):
+                out[k] = dask.array.stack(out[k])
+            else:
+                out[k] = dask.array.array(out[k])
+        except NotImplementedError:
+            # There are data structured that dask auto-chunking cannot handle,
+            # such as an list of list of variable length. For now, let these go
+            # out as plain numpy arrays. In the future we might make them dask
+            # arrays with manual chunks.
+            out[k] = numpy.asarray(out[k])
+
+    return out
