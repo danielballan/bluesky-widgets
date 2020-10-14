@@ -1,5 +1,9 @@
 import collections
+from datetime import datetime
+import functools
+
 import event_model
+
 from .event import EmitterGroup, Event
 
 
@@ -14,32 +18,39 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
         self.stop_doc = None
         self.events = EmitterGroup(new_stream=Event, new_data=Event, completed=Event)
         self._stream_names = set()
+        self._ordered = []
 
     def start(self, doc):
         self.start_doc = doc
+        self._ordered.append(doc)
 
     def stop(self, doc):
         self.stop_doc = doc
+        self._ordered.append(doc)
         self.events.completed()
 
     def event_page(self, doc):
         self.event_pages[doc["descriptor"]].append(doc)
+        self._ordered.append(doc)
         self.events.new_data()
 
     def datum_page(self, doc):
         self.datum_pages_by_resource[doc["resource"]].append(doc)
+        self._ordered.append(doc)
         for datum_id in doc["datum_id"]:
             self.resource_uid_by_datum_id[datum_id] = doc["resource"]
 
     def descriptor(self, doc):
         name = doc.get("name")  # Might be missing in old documents
+        self.descriptors[doc["uid"]] = doc
+        self._ordered.append(doc)
         if name is not None and name not in self._stream_names:
             self._stream_names.add(name)
             self.events.new_stream(name)
-        self.descriptors[doc["uid"]] = doc
 
     def resource(self, doc):
         self.resources[doc["uid"]] = doc
+        self._ordered.append(doc)
 
 
 class StreamExists(event_model.EventModelRuntimeError):
@@ -94,9 +105,21 @@ class RunBuilder:
         for stream in self._streams.values():
             stream._close()
 
-    def get_run(self):
-        # TODO Maybe return the same instance every time. Maybe not....
-        return BlueskyRun(self._cache)
+    def get_run(
+        self,
+        *,
+        handler_registry=None,
+        root_map=None,
+        filler_class=event_model.Filler,
+        transforms=None,
+    ):
+        return BlueskyRun(
+            document_cache=self._cache,
+            handler_registry=handler_registry,
+            root_map=root_map,
+            filler_class=filler_class,
+            transforms=transforms,
+        )
 
     def __enter__(self):
         return self
@@ -158,9 +181,84 @@ class BlueskyRun:
     Push-based BlueskyRun
     """
 
-    def __init__(self, document_cache, get_filler):
+    def __init__(
+        self,
+        *,
+        document_cache,
+        handler_registry=None,
+        root_map=None,
+        filler_class=event_model.Filler,
+        transforms=None,
+    ):
+
         self._document_cache = document_cache
-        self._get_filler = get_filler
+        self._streams = {}
+
+        from databroker.core import (
+            parse_transforms,
+            parse_handler_registry,
+            discover_handlers,
+            Start,
+            Stop,
+        )
+
+        self._root_map = root_map or {}
+        self._filler_class = filler_class
+        self._transforms = parse_transforms(transforms)
+        if handler_registry is None:
+            handler_registry = discover_handlers()
+        self._handler_registry = parse_handler_registry(handler_registry)
+        self.handler_registry = event_model.HandlerRegistryView(self._handler_registry)
+
+        self._get_filler = functools.partial(
+            self._filler_class,
+            handler_registry=self.handler_registry,
+            root_map=self._root_map,
+            inplace=False,
+        )
+        self.metadata = {
+            "start": Start(self._transforms["start"](document_cache.start_doc))
+        }
+        if self._document_cache.stop_doc is None:
+            self.metadata["stop"] = None
+        else:
+            self.metadata["stop"] = Stop(
+                self._transforms["stop"](self._document_cache.stop_doc)
+            )
+
+        def on_completed(event):
+            self.metadata["stop"] = Stop(
+                self._transforms["stop"](self._document_cache.stop_doc)
+            )
+
+        self._document_cache.events.completed.connect(on_completed)
+
+    def __iter__(self):
+        yield from self._streams.items()
+
+    def __repr__(self):
+        try:
+            start = self.metadata["start"]
+            return f"<{self.__class__.__name__} uid={start['uid']!r}>"
+        except Exception as exc:
+            return f"<{self.__class__.__name__} *REPR RENDERING FAILURE* {exc!r}>"
+
+    def _repr_pretty_(self, p, cycle):
+        try:
+            start = self.metadata["start"]
+            stop = self.metadata["stop"] or {}
+            out = (
+                f"BlueskyRun\n"
+                f"  uid={start['uid']!r}\n"
+                f"  exit_status={stop.get('exit_status')!r}\n"
+                f"  {_ft(start['time'])} -- {_ft(stop.get('time', '?'))}\n"
+                f"  Streams:\n"
+            )
+            for stream_name in self:
+                out += f"    * {stream_name}\n"
+        except Exception as exc:
+            out = f"<{self.__class__.__name__} *REPR_RENDERING_FAILURE* {exc!r}>"
+        p.text(out)
 
     @property
     def events(self):
@@ -389,3 +487,11 @@ def _documents_to_xarray(
     # per stream, but as of this writing we must account for the
     # possibility of multiple.)
     return xarray.merge(datasets)
+
+
+def _ft(timestamp):
+    "format timestamp"
+    if isinstance(timestamp, str):
+        return timestamp
+    # Truncate microseconds to miliseconds. Do not bother to round.
+    return (datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S.%f"))[:-3]
