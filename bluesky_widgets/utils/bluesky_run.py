@@ -18,10 +18,11 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
         self.resource_uid_by_datum_id = {}
         self.start_doc = None
         self.stop_doc = None
-        self.events = EmitterGroup(new_stream=Event, new_data=Event, completed=Event)
+        self.events = EmitterGroup(started=Event, new_stream=Event, new_data=Event, completed=Event)
         # maps stream name to list of descriptors
         self._streams = {}
         self._ordered = []
+        super().__init__()
 
     @property
     def streams(self):
@@ -30,22 +31,27 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
     def start(self, doc):
         self.start_doc = doc
         self._ordered.append(doc)
+        self.events.started()
+        super().start(doc)
 
     def stop(self, doc):
         self.stop_doc = doc
         self._ordered.append(doc)
         self.events.completed()
+        super().stop(doc)
 
     def event_page(self, doc):
         self.event_pages[doc["descriptor"]].append(doc)
         self._ordered.append(doc)
         self.events.new_data()
+        super().event_page(doc)
 
     def datum_page(self, doc):
         self.datum_pages_by_resource[doc["resource"]].append(doc)
         self._ordered.append(doc)
         for datum_id in doc["datum_id"]:
             self.resource_uid_by_datum_id[datum_id] = doc["resource"]
+        super().datum_page(doc)
 
     def descriptor(self, doc):
         name = doc.get("name")  # Might be missing in old documents
@@ -56,10 +62,12 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
             self.events.new_stream(name=name)
         else:
             self._streams[name].append(doc)
+        super().descriptor(doc)
 
     def resource(self, doc):
         self.resources[doc["uid"]] = doc
         self._ordered.append(doc)
+        super().resource(doc)
 
 
 class StreamExists(event_model.EventModelRuntimeError):
