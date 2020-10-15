@@ -600,12 +600,14 @@ def _flatten_event_page_gen(gen):
         yield from event_model.unpack_event_page(page)
 
 
-def _fill(filler,
-          event,
-          lookup_resource_for_datum,
-          get_resource,
-          get_datum_pages,
-          last_datum_id=None):
+def _fill(
+    filler,
+    event,
+    lookup_resource_for_datum,
+    get_resource,
+    get_datum_pages,
+    last_datum_id=None,
+):
     try:
         _, filled_event = filler("event", event)
         return filled_event
@@ -686,7 +688,7 @@ def _transpose(in_data, keys, field):
     for k in keys:
         try:
             # compatibility with dask < 2
-            if hasattr(out[k][0], 'shape'):
+            if hasattr(out[k][0], "shape"):
                 out[k] = dask.array.stack(out[k])
             else:
                 out[k] = dask.array.array(out[k])
