@@ -207,8 +207,6 @@ class StreamBuilder:
         if self._closed:
             raise event_model.EventModelRuntimeError("Run is closed.")
         import time as time_module
-        import xarray
-        import pandas
 
         len_ = len(data[next(iter(data))])
         now = time_module.time()
@@ -218,17 +216,10 @@ class StreamBuilder:
             timestamps = {k: [now] * len_ for k in data}
         if seq_num is None:
             seq_num = list(range(len_))
-        if isinstance(data, xarray.Dataset):
-            normalized_data = {k: v['data'] for k, v in data.to_dict()['data_vars'].items()}
-        elif isinstance(data, pandas.DataFrame):
-            # Is there a better way?
-            normalized_data = {k: v.values for k, v in data.items()}
-        else:
-            normalized_data = data
         doc = self._bundle.compose_event_page(
             time=time,
-            data=normalized_data,
-            timestamps=timestamps,
+            data=_normalize_dataframe_like(data),
+            timestamps=_normalize_dataframe_like(timestamps),
             seq_num=seq_num,
             uid=uid,
         )
@@ -236,6 +227,20 @@ class StreamBuilder:
 
     def _close(self):
         self._closed = True
+
+
+def _normalize_dataframe_like(df):
+    "Normalize xarray.Dataset and pandas.DataFrame to be dict-of-arrays."
+    import xarray
+    import pandas
+
+    if isinstance(df, xarray.Dataset):
+        return {k: v['data'] for k, v in df.to_dict()['data_vars'].items()}
+    elif isinstance(df, pandas.DataFrame):
+        # Is there a better way?
+        return {k: v.values for k, v in df.items()}
+    else:
+        return df
 
 
 class BlueskyRun(collections.abc.Mapping):
