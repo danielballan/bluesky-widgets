@@ -250,8 +250,8 @@ class BlueskyRun(collections.abc.Mapping):
 
     def __init__(
         self,
-        *,
         document_cache,
+        *,
         handler_registry=None,
         root_map=None,
         filler_class=event_model.Filler,
