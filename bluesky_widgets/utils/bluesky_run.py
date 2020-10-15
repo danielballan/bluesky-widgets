@@ -5,6 +5,7 @@ from datetime import datetime
 import functools
 
 import event_model
+import numpy
 
 from .event import EmitterGroup, Event
 
@@ -77,6 +78,58 @@ class StreamExists(event_model.EventModelRuntimeError):
 
 
 class RunBuilder(collections.abc.Mapping):
+    """
+    Construct a BlueskyRun from xarray.Dataset, pandas.DataFrame, or dict-of-lists.
+
+    Parameters
+    ----------
+    metadata : dict
+        This should include metadata about what will be done and any adminstrative info.
+    uid : string, optional
+        By default, a UUID4 is generated.
+    time : float
+        POSIX epoch time. By default, the current time is used.
+
+    Examples
+    --------
+
+    Minimal example
+
+    >>> builder = RunBuilder()
+    >>> run = builder.get_run()  # -> BluekyRun. This may be called at any point.
+    >>> builder.add_stream("primary", data={"x": [1, 2, 3]})
+    >>> builder.close()
+
+    Context manager closes automatically on exit from context, and marks
+
+    >>> with RunBuilder() as builder:
+    >>> ... builder.add_stream("primary", data={"x": [1, 2, 3]})
+    >>> ...
+
+    Add data incrementally.
+
+    >>> with RunBuilder() as builder:
+    >>> ... builder.add_stream("primary", data={"x": [1, 2, 3]})
+    >>> ... builder.add_data("primary", data={"x": [4, 5, 6]})
+    >>> ... builder.add_data("primary", data={"x": [7, 8, 9]})
+    >>> ...
+
+    Define the stream without adding data at first.
+
+    >>> with RunBuilder() as builder:
+    >>> ... builder.add_stream("primary",
+    >>> ...     data_keys={"x": {"dtype": "number", "shape": [], "source": "whatever"}}
+    >>> ... builder.add_data("primary", data={"x": [1, 2, 3]})
+
+
+    Additional metadata (placed in Run Start document)
+
+    >>> with RunBuilder({"sample": "Cu"}) as builder:
+    >>> ... builder.add_stream("primary", data={"x": [1, 2, 3]})
+    >>> ...
+
+    """
+
     def __init__(self, metadata=None, uid=None, time=None):
         self._cache = DocumentCache()
         self._run_bundle = event_model.compose_run(
@@ -109,19 +162,58 @@ class RunBuilder(collections.abc.Mapping):
     def add_stream(
         self,
         name,
-        data_keys,
+        *,
+        data=None,
+        data_keys=None,
         uid=None,
         time=None,
         object_keys=None,
         configuration=None,
         hints=None,
     ):
+        """
+        Define a new stream (table of data) and, optionally add data to it.
+
+        Parameters
+        ----------
+        name : string
+            Any string. The name "primary" is conventional (but not required)
+            for the primary table of interest, if any.
+        data : xarray.Dataset, pandas.DataFrame, or dict-of-arrays-or-lists, optional
+        data_keys : dict, optional
+            Metadata about the columns. If not specified, it will be inferred.
+            Required items are:
+
+                * source --- a freeform string
+                * dtype --- one of "array", "bool", "string", "integer", "number"
+                * shape --- list of dimensions (empty for scalars)
+        object_keys : dict, optional
+            Map a device map to a list of the associated keys in data_keys
+        configuration : dict, optional
+            Map each device in object_keys to a dict of data_keys, data, and
+            timestamps.
+        hints : dict, optional
+            Dict mapping "fields" to list of most commonly interesting
+            keys in data_keys to aid in producing best-effort
+            visualizations and other downstream tools.
+
+        Raises
+        ------
+        StreamExists
+            If the name has already been used. Use :meth:`add_data` to add data
+            to an existing stream.
+        """
+        if data is None and data_keys is None:
+            raise event_model.EventModelValueError(
+                "Neither 'data' nor 'data_keys' was given. At least one is " "required."
+            )
         if name in self._streams:
             raise StreamExists(name)
         builder = StreamBuilder(
             cache=self._cache,
             compose_descriptor=self._run_bundle.compose_descriptor,
             name=name,
+            data=data,
             data_keys=data_keys,
             time=time,
             object_keys=object_keys,
@@ -131,6 +223,21 @@ class RunBuilder(collections.abc.Mapping):
         self._streams[name] = builder
 
     def close(self, exit_status="success", reason="", uid=None, time=None):
+        """
+        Mark the Run as complete.
+
+        It will not be possible to add new streams or new data once this is
+        called.
+
+        Parameters
+        ----------
+        exit_status : {"success", "abort", "fail"}, optional
+        reason : string, optional
+        uid : string, optional
+            By default, a UUID4 is generated.
+        time : float
+            POSIX epoch time. By default, the current time is used.
+        """
         doc = self._run_bundle.compose_stop(
             exit_status=exit_status, reason=reason, uid=uid, time=time
         )
@@ -166,12 +273,19 @@ class RunBuilder(collections.abc.Mapping):
 
 
 class StreamBuilder:
+    """
+    This should never be instantiated by user code.
+
+    This is used by the RunBuilder.
+    """
+
     def __init__(
         self,
         *,
         cache,
         compose_descriptor,
         name,
+        data,
         data_keys,
         time,
         object_keys,
@@ -181,6 +295,16 @@ class StreamBuilder:
         self._compose_descriptor = compose_descriptor
         self._cache = cache
         self._closed = False
+        if data_keys is None:
+            # Infer the data_keys from the data.
+            data_keys = {
+                k: {
+                    "source": "RunBuilder",
+                    "dtype": _infer_dtype(next(iter(v))),
+                    "shape": _infer_shape(v),
+                }
+                for k, v in data.items()
+            }
         self._bundle = compose_descriptor(
             name=name,
             data_keys=data_keys,
@@ -190,6 +314,8 @@ class StreamBuilder:
             hints=hints,
         )
         self._cache.descriptor(self._bundle.descriptor_doc)
+        if data is not None:
+            self.add_data(data=data, time=time)
 
     def update_configuration(self, name, configuration):
         if self._closed:
@@ -229,6 +355,35 @@ class StreamBuilder:
 
     def _close(self):
         self._closed = True
+
+
+def _infer_dtype(obj):
+    "Infer the dtype for Event Descriptor data_keys based on the data."
+    if isinstance(obj, (numpy.generic, numpy.ndarray)):
+        if numpy.isscalar(obj):
+            obj = obj.item()
+        else:
+            return "array"
+    elif isinstance(obj, str):
+        return "string"
+    elif isinstance(obj, collections.abc.Iterable):
+        return "array"
+    elif isinstance(obj, bool):
+        return "bool"
+    elif isinstance(obj, int):
+        return "integer"
+    else:
+        return "number"
+
+
+def _infer_shape(obj):
+    "Infer the shape for Event Descriptor data_keys based on the data."
+    if hasattr(obj, "shape"):
+        # The first axis is the "Event" axis. We want the shape of the data
+        # within a given Event, so we trim off the first axis.
+        return obj.shape[1:]
+    else:
+        return []
 
 
 def _normalize_dataframe_like(df):
