@@ -195,9 +195,36 @@ class StreamBuilder:
         )
         self._cache.descriptor(self._bundle.descriptor_doc)
 
-    def add_data(self, data):
+    def add_data(self, data, time=None, timestamps=None, seq_num=None, uid=None):
         if self._closed:
             raise event_model.EventModelRuntimeError("Run is closed.")
+        import time as time_module
+        import xarray
+        import pandas
+
+        len_ = len(data[next(iter(data))])
+        now = time_module.time()
+        if time is None:
+            time = [now] * len_
+        if timestamps is None:
+            timestamps = {k: [now] * len_ for k in data}
+        if seq_num is None:
+            seq_num = list(range(len_))
+        if isinstance(data, xarray.Dataset):
+            normalized_data = {k: v['data'] for k, v in data.to_dict()['data_vars'].items()}
+        elif isinstance(data, pandas.DataFrame):
+            # Is there a better way?
+            normalized_data = {k: v.values for k, v in data.items()}
+        else:
+            normalized_data = data
+        doc = self._bundle.compose_event_page(
+            time=time,
+            data=normalized_data,
+            timestamps=timestamps,
+            seq_num=seq_num,
+            uid=uid,
+        )
+        self._cache.event_page(doc)
 
     def _close(self):
         self._closed = True
