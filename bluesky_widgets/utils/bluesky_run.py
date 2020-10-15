@@ -198,7 +198,7 @@ class StreamBuilder:
             data_keys=doc["data_keys"],
             time=doc["time"],
             object_keys=doc["object_keys"],
-            configuration=doc["configuration"],
+            configuration=configuration,
             hints=doc["hints"],
         )
         self._cache.descriptor(self._bundle.descriptor_doc)
