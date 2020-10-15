@@ -18,7 +18,9 @@ class DocumentCache(event_model.SingleRunDocumentRouter):
         self.resource_uid_by_datum_id = {}
         self.start_doc = None
         self.stop_doc = None
-        self.events = EmitterGroup(started=Event, new_stream=Event, new_data=Event, completed=Event)
+        self.events = EmitterGroup(
+            started=Event, new_stream=Event, new_data=Event, completed=Event
+        )
         # maps stream name to list of descriptors
         self._streams = {}
         self._ordered = []
@@ -235,7 +237,7 @@ def _normalize_dataframe_like(df):
     import pandas
 
     if isinstance(df, xarray.Dataset):
-        return {k: v['data'] for k, v in df.to_dict()['data_vars'].items()}
+        return {k: v["data"] for k, v in df.to_dict()["data_vars"].items()}
     elif isinstance(df, pandas.DataFrame):
         # Is there a better way?
         return {k: v.values for k, v in df.items()}
