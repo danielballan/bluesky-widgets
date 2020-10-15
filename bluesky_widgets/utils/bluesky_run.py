@@ -148,7 +148,11 @@ class RunBuilder(collections.abc.Mapping):
         return self
 
     def __exit__(self, type, value, traceback):
-        self.close(exit_status="failed", reason=repr(type(value)))
+        if type is not None:
+            reason = repr(value)
+            self.close(exit_status="fail", reason=reason)
+        else:
+            self.close()  # success
 
 
 class StreamBuilder:
