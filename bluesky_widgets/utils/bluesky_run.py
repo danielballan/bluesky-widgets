@@ -541,14 +541,17 @@ class BlueskyRun(collections.abc.Mapping):
             start = self.metadata["start"]
             stop = self.metadata["stop"] or {}
             out = (
-                f"BlueskyRun\n"
+                "BlueskyRun\n"
                 f"  uid={start['uid']!r}\n"
                 f"  exit_status={stop.get('exit_status')!r}\n"
                 f"  {_ft(start['time'])} -- {_ft(stop.get('time', '?'))}\n"
-                f"  Streams:\n"
             )
-            for stream_name in self:
-                out += f"    * {stream_name}\n"
+            if len(self):
+                out += "  Streams:\n"
+                for stream_name in self:
+                    out += f"    * {stream_name}\n"
+            else:
+                out += "  (No Streams)"
         except Exception as exc:
             out = f"<{self.__class__.__name__} *REPR_RENDERING_FAILURE* {exc!r}>"
         p.text(out)
