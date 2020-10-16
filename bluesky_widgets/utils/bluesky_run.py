@@ -360,8 +360,16 @@ class RunBuilder:
         filler_class=event_model.Filler,
         transforms=None,
     ):
+        """
+        Provide a BlueskyRun built by this RunBuilder.
+
+        Returns
+        -------
+        BlueskyRun
+        """
         return BlueskyRun(
             document_cache=self._cache,
+            # TODO These arguments are *proabably* not needed.
             handler_registry=handler_registry,
             root_map=root_map,
             filler_class=filler_class,
@@ -602,12 +610,121 @@ class BlueskyRun(collections.abc.Mapping):
         return self._document_cache.events
 
 
+class ConfigAccessor(collections.abc.Mapping):
+    def __init__(self, stream):
+        self._stream = stream
+        # Cache of object names mapped to BlueskyConfig objects
+        self._config = {}
+
+    # The following three methods are required to implement the Mapping interface.
+
+    def __getitem__(self, key):
+        # Return BlueskyConfig object for this key. Lazily create them as
+        # needed.
+        try:
+            config = self._config[key]
+        except KeyError:
+            if key not in self._objects:
+                raise
+            config = BlueskyConfig(self._stream, key)
+            self._config[key] = config
+        return config
+
+    def __len__(self):
+        return len(self._objects)
+
+    def __iter__(self):
+        yield from self._objects
+
+    def __getattr__(self, key):
+        # Allow dot access for any object names, as long as they are (of
+        # course) valid Python identifiers and do not collide with existing
+        # method names.
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(key)
+
+    def __repr__(self):
+        return f"<Config Accessor: {sorted(self._objects)}>"
+
+    @property
+    def _objects(self):
+        "Names of valid objects (i.e. devices)"
+        objects = set()
+        for d in self._stream._descriptors:
+            objects.update(set(d["object_keys"]))
+        return objects
+
+
+class BlueskyConfig:
+    def __init__(self, stream, object_name):
+        self._stream = stream
+        self._object_name = object_name
+
+    def __repr__(self):
+        return f"<BlueskyConfig for {self._object_name} in stream {self._stream.name}>"
+
+    def to_dask(self):
+
+        document_cache = self._stream._document_cache
+
+        def get_event_pages(descriptor_uid, skip=0, limit=None):
+            if skip != 0 and limit is not None:
+                raise NotImplementedError
+            return document_cache.event_pages[descriptor_uid]
+
+        # def get_event_count(descriptor_uid):
+        #     return sum(len(page['seq_num'])
+        #                for page in (document_cache.event_pages[descriptor_uid]))
+
+        def get_resource(uid):
+            return document_cache.resources[uid]
+
+        # def get_resources():
+        #     return list(document_cache.resources.values())
+
+        def lookup_resource_for_datum(datum_id):
+            return document_cache.resource_uid_by_datum_id[datum_id]
+
+        def get_datum_pages(resource_uid, skip=0, limit=None):
+            if skip != 0 and limit is not None:
+                raise NotImplementedError
+            return document_cache.datum_pages_by_resource[resource_uid]
+
+        filler = self._stream._get_filler(coerce="delayed")
+
+        ds = _documents_to_xarray_config(
+            object_name=self._object_name,
+            start_doc=document_cache.start_doc,
+            stop_doc=document_cache.stop_doc,
+            descriptor_docs=self._stream._descriptors,
+            get_event_pages=get_event_pages,
+            filler=filler,
+            get_resource=get_resource,
+            lookup_resource_for_datum=lookup_resource_for_datum,
+            get_datum_pages=get_datum_pages,
+        )
+        return ds
+
+    def read(self):
+        return self.to_dask().load()
+
+
 class BlueskyEventStream:
     def __init__(self, stream_name, document_cache, get_filler, transform):
         self._stream_name = stream_name
         self._document_cache = document_cache
         self._get_filler = get_filler
         self._transform = transform
+        self.config = ConfigAccessor(self)
+
+    @property
+    def name(self):
+        return self._stream_name
+
+    def __repr__(self):
+        return f"<BlueskyEventStream {self.name}>"
 
     @property
     def _descriptors(self):
@@ -709,7 +826,6 @@ def _documents_to_xarray(
     -------
     dataset : xarray.Dataset
     """
-    import numpy
     import xarray
 
     if include is None:
@@ -735,7 +851,6 @@ def _documents_to_xarray(
     datasets = []
     dim_counter = itertools.count()
     event_dim_labels = {}
-    config_dim_labels = {}
     for descriptor in descriptor_docs:
         events = list(_flatten_event_page_gen(get_event_pages(descriptor["uid"])))
         if not events:
@@ -760,9 +875,8 @@ def _documents_to_xarray(
         data_table = _transpose(filled_events, keys, "data")
         # external_keys = [k for k in data_keys if 'external' in data_keys[k]]
 
-        # Collect a DataArray for each field in Event, each field in
-        # configuration, and 'seq_num'. The Event 'time' will be the
-        # default coordinate.
+        # Collect a DataArray for each field in Event, 'uid', and 'seq_num'.
+        # The Event 'time' will be the default coordinate.
         data_arrays = {}
 
         # Make DataArrays for Event data.
@@ -781,49 +895,21 @@ def _documents_to_xarray(
                 except KeyError:
                     dims = tuple(f"dim_{next(dim_counter)}" for _ in range(ndim))
                     event_dim_labels[key] = dims
+            attrs = {}
+            # Record which object (i.e. device) this column is associated with,
+            # which enables one to find the relevant configuration, if any.
+            for object_name, keys_ in descriptor.get("object_keys", {}).items():
+                for item in keys_:
+                    if item == key:
+                        attrs["object"] = object_name
+                        break
             data_arrays[key] = xarray.DataArray(
                 data=data_table[key],
                 dims=("time",) + dims,
                 coords={"time": times},
                 name=key,
+                attrs=attrs,
             )
-
-        # Make DataArrays for configuration data.
-        for object_name, config in descriptor.get("configuration", {}).items():
-            data_keys = config["data_keys"]
-            # For configuration, label the dimension specially to
-            # avoid key collisions.
-            scoped_data_keys = {key: f"{object_name}:{key}" for key in data_keys}
-            if include:
-                keys = {k: v for k, v in scoped_data_keys.items() if v in include}
-            elif exclude:
-                keys = {k: v for k, v in scoped_data_keys.items() if v not in include}
-            else:
-                keys = scoped_data_keys
-            for key, scoped_key in keys.items():
-                field_metadata = data_keys[key]
-                ndim = len(field_metadata["shape"])
-                # if the EventDescriptor doesn't provide names for the
-                # dimensions (it's optional) use the same default dimension
-                # names that xarray would.
-                try:
-                    dims = tuple(field_metadata["dims"])
-                except KeyError:
-                    try:
-                        dims = config_dim_labels[key]
-                    except KeyError:
-                        dims = tuple(f"dim_{next(dim_counter)}" for _ in range(ndim))
-                        config_dim_labels[key] = dims
-                data_arrays[scoped_key] = xarray.DataArray(
-                    # TODO Once we know we have one Event Descriptor
-                    # per stream we can be more efficient about this.
-                    data=numpy.tile(
-                        config["data"][key], (len(times),) + ndim * (1,) or 1
-                    ),
-                    dims=("time",) + dims,
-                    coords={"time": times},
-                    name=key,
-                )
 
         # Finally, make DataArrays for 'seq_num' and 'uid'.
         data_arrays["seq_num"] = xarray.DataArray(
@@ -832,6 +918,116 @@ def _documents_to_xarray(
         data_arrays["uid"] = xarray.DataArray(
             data=uids, dims=("time",), coords={"time": times}, name="uid"
         )
+
+        datasets.append(xarray.Dataset(data_vars=data_arrays))
+    # Merge Datasets from all Event Descriptors into one representing the
+    # whole stream. (In the future we may simplify to one Event Descriptor
+    # per stream, but as of this writing we must account for the
+    # possibility of multiple.)
+    return xarray.merge(datasets)
+
+
+def _documents_to_xarray_config(
+    *,
+    object_name,
+    start_doc,
+    stop_doc,
+    descriptor_docs,
+    get_event_pages,
+    filler,
+    get_resource,
+    lookup_resource_for_datum,
+    get_datum_pages,
+    include=None,
+    exclude=None,
+):
+    """
+    Represent the data in one Event stream as an xarray.
+
+    Parameters
+    ----------
+    object_name : str
+        Object (i.e. device) name of interest
+    start_doc: dict
+        RunStart Document
+    stop_doc : dict
+        RunStop Document
+    descriptor_docs : list
+        EventDescriptor Documents
+    filler : event_model.Filler
+    get_resource : callable
+        Expected signature ``get_resource(resource_uid) -> Resource``
+    lookup_resource_for_datum : callable
+        Expected signature ``lookup_resource_for_datum(datum_id) -> resource_uid``
+    get_datum_pages : callable
+        Expected signature ``get_datum_pages(resource_uid) -> generator``
+        where ``generator`` yields datum_page documents
+    get_event_pages : callable
+        Expected signature ``get_event_pages(descriptor_uid) -> generator``
+        where ``generator`` yields event_page documents
+    include : list, optional
+        Fields ('data keys') to include. By default all are included. This
+        parameter is mutually exclusive with ``exclude``.
+    exclude : list, optional
+        Fields ('data keys') to exclude. By default none are excluded. This
+        parameter is mutually exclusive with ``include``.
+
+    Returns
+    -------
+    dataset : xarray.Dataset
+    """
+    import numpy
+    import xarray
+
+    if include is None:
+        include = []
+    if exclude is None:
+        exclude = []
+    if include and exclude:
+        raise ValueError(
+            "The parameters `include` and `exclude` are mutually exclusive."
+        )
+
+    # Collect a Dataset for each descriptor. Merge at the end.
+    datasets = []
+    dim_counter = itertools.count()
+    config_dim_labels = {}
+    for descriptor in descriptor_docs:
+        events = list(_flatten_event_page_gen(get_event_pages(descriptor["uid"])))
+        if not events:
+            continue
+        times = [ev["time"] for ev in events]
+        # external_keys = [k for k in data_keys if 'external' in data_keys[k]]
+
+        # Collect a DataArray for each field configuration. The Event 'time'
+        # will be the default coordinate.
+        data_arrays = {}
+
+        # Make DataArrays for configuration data.
+        config = descriptor["configuration"][object_name]
+        data_keys = config["data_keys"]
+        for key in data_keys:
+            field_metadata = data_keys[key]
+            ndim = len(field_metadata["shape"])
+            # if the EventDescriptor doesn't provide names for the
+            # dimensions (it's optional) use the same default dimension
+            # names that xarray would.
+            try:
+                dims = tuple(field_metadata["dims"])
+            except KeyError:
+                try:
+                    dims = config_dim_labels[key]
+                except KeyError:
+                    dims = tuple(f"dim_{next(dim_counter)}" for _ in range(ndim))
+                    config_dim_labels[key] = dims
+            data_arrays[key] = xarray.DataArray(
+                # TODO Once we know we have one Event Descriptor
+                # per stream we can be more efficient about this.
+                data=numpy.tile(config["data"][key], (len(times),) + ndim * (1,) or 1),
+                dims=("time",) + dims,
+                coords={"time": times},
+                name=key,
+            )
 
         datasets.append(xarray.Dataset(data_vars=data_arrays))
     # Merge Datasets from all Event Descriptors into one representing the
