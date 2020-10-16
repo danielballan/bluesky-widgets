@@ -77,7 +77,11 @@ class StreamExists(event_model.EventModelRuntimeError):
     ...
 
 
-class RunBuilder(collections.abc.Mapping):
+class StreamDoesNotExist(event_model.EventModelRuntimeError):
+    ...
+
+
+class RunBuilder:
     """
     Construct a BlueskyRun from xarray.Dataset, pandas.DataFrame, or dict-of-lists.
 
@@ -87,7 +91,7 @@ class RunBuilder(collections.abc.Mapping):
         This should include metadata about what will be done and any adminstrative info.
     uid : string, optional
         By default, a UUID4 is generated.
-    time : float
+    time : float, optional
         POSIX epoch time. By default, the current time is used.
 
     Examples
@@ -136,28 +140,8 @@ class RunBuilder(collections.abc.Mapping):
             uid=uid, time=time, metadata=metadata
         )
         self._cache.start(self._run_bundle.start_doc)
-        # maps stream name to StreamBuilder
+        # maps stream name to bundle returned by compose_descriptor
         self._streams = {}
-
-    # The following three methods are required to implement the Mapping interface.
-
-    def __getitem__(self, key):
-        return self._streams[key]
-
-    def __len__(self):
-        return len(self._streams)
-
-    def __iter__(self):
-        yield from self._streams
-
-    def __getattr__(self, key):
-        # Allow dot access for any stream names, as long as they are (of
-        # course) valid Python identifiers and do not collide with existing
-        # method names.
-        try:
-            return self._streams[key]
-        except KeyError:
-            raise AttributeError(key)
 
     def add_stream(
         self,
@@ -187,6 +171,11 @@ class RunBuilder(collections.abc.Mapping):
                 * source --- a freeform string
                 * dtype --- one of "array", "bool", "string", "integer", "number"
                 * shape --- list of dimensions (empty for scalars)
+
+        uid : string, optional
+            By default, a UUID4 is generated.
+        time : float, optional
+            POSIX epoch time. By default, the current time is used.
         object_keys : dict, optional
             Map a device map to a list of the associated keys in data_keys
         configuration : dict, optional
@@ -208,19 +197,130 @@ class RunBuilder(collections.abc.Mapping):
                 "Neither 'data' nor 'data_keys' was given. At least one is " "required."
             )
         if name in self._streams:
-            raise StreamExists(name)
-        builder = StreamBuilder(
-            cache=self._cache,
-            compose_descriptor=self._run_bundle.compose_descriptor,
+            raise StreamExists(
+                f"The stream {name!r} exists. Use the method `add_data` to add "
+                "more data to the stream."
+            )
+        if data_keys is None:
+            # Infer the data_keys from the data.
+            data_keys = {
+                k: {
+                    "source": "RunBuilder",
+                    "dtype": _infer_dtype(next(iter(v))),
+                    "shape": _infer_shape(v),
+                }
+                for k, v in data.items()
+            }
+        bundle = self._run_bundle.compose_descriptor(
             name=name,
-            data=data,
             data_keys=data_keys,
             time=time,
             object_keys=object_keys,
             configuration=configuration,
             hints=hints,
         )
-        self._streams[name] = builder
+        self._streams[name] = bundle
+        self._cache.descriptor(bundle.descriptor_doc)
+        if data is not None:
+            self.add_data(name=name, data=data, time=time)
+
+    def add_data(self, name, data, time=None, timestamps=None, seq_num=None, uid=None):
+        """
+        Add data to an existing stream.
+
+        Parameters
+        ----------
+        name : string
+            Name of a stream previously created using :meth:`add_stream`
+        data : xarray.Dataset, pandas.DataFrame, or dict-of-arrays-or-lists
+        time : array, optional
+            POSIX epoch times. By default, an array of the current time is used.
+        timestamps : xarray.Dataset, pandas.DataFrame, or dict-of-arrays-or-lists
+            Individual timestamps for every element in data. This level of
+            detail is sometimes available from data acquisition systems, but it
+            is rarely available or useful in other contexts.
+        seq_num : array, optional
+            Sequence numbers.
+        uid : string, optional
+            By default, a UUID4 is generated.
+
+        Raises
+        ------
+        StreamDoesNotExist
+            If stream with the given name has not yet been created using
+            :meth:`add_stream`.
+        EventModelRuntimeErrror
+            If the run has been closed.
+        """
+        if name not in self._streams:
+            raise StreamDoesNotExist(
+                "First use the method `add_stream` to create a stream named "
+                f"{name!r}. You can add data there and/or add it later separately "
+                "using this method, `add_data`."
+            )
+        if self.closed:
+            raise event_model.EventModelRuntimeError("Run is closed.")
+        import time as time_module
+
+        len_ = len(data[next(iter(data))])
+        now = time_module.time()
+        if time is None:
+            time = [now] * len_
+        if timestamps is None:
+            timestamps = {k: [now] * len_ for k in data}
+        if seq_num is None:
+            seq_num = list(range(len_))
+        bundle = self._streams[name]
+        doc = bundle.compose_event_page(
+            time=time,
+            data=_normalize_dataframe_like(data),
+            timestamps=_normalize_dataframe_like(timestamps),
+            seq_num=seq_num,
+            uid=uid,
+        )
+        self._cache.event_page(doc)
+
+    def update_configuration(self, name, configuration):
+        """
+        Update the configuration in a stream.
+
+        This issues a new Event Descriptor for a stream.
+
+        Paramters
+        ---------
+        name : string
+        configuration : dict
+            See add_stream for expected structure.
+
+        Raises
+        ------
+        StreamDoesNotExist
+            If stream with the given name has not yet been created using
+            :meth:`add_stream`.
+        EventModelRuntimeErrror
+            If the run has been closed.
+        """
+        if self.closed:
+            raise event_model.EventModelRuntimeError("Run is closed.")
+        if name not in self._streams:
+            raise StreamDoesNotExist(
+                "First use the method `add_stream` to create a stream named "
+                f"{name!r}."
+            )
+        # Fill in everything except configuration using the previous Event
+        # Descriptor in this stream.
+        old_bundle = self._streams[name]
+        doc = old_bundle.descriptor_doc
+        bundle = self._compose_descriptor(
+            name=doc["name"],
+            data_keys=doc["data_keys"],
+            time=doc["time"],
+            object_keys=doc["object_keys"],
+            configuration=configuration,
+            hints=doc["hints"],
+        )
+        self._streams[name] = bundle
+        self._cache.descriptor(bundle.descriptor_doc)
 
     def close(self, exit_status="success", reason="", uid=None, time=None):
         """
@@ -238,15 +338,19 @@ class RunBuilder(collections.abc.Mapping):
         time : float
             POSIX epoch time. By default, the current time is used.
         """
-        closed = self._cache.stop_doc is not None
-        if closed:
+        if self.closed:
             raise event_model.EventModelRuntimeError("Run is already closed.")
         doc = self._run_bundle.compose_stop(
             exit_status=exit_status, reason=reason, uid=uid, time=time
         )
         self._cache.stop(doc)
-        for stream in self._streams.values():
-            stream._close()
+
+    @property
+    def closed(self):
+        """
+        True if the Run has been closed and cannot accept new data.
+        """
+        return self._cache.stop_doc is not None
 
     def get_run(
         self,
@@ -268,99 +372,13 @@ class RunBuilder(collections.abc.Mapping):
         return self
 
     def __exit__(self, type, value, traceback):
-        closed = self._cache.stop_doc is not None
         if type is not None:
             reason = repr(value)
-            if not closed:
+            if not self.closed:
                 self.close(exit_status="fail", reason=reason)
         else:
-            if not closed:
+            if not self.closed:
                 self.close()  # success
-
-
-class StreamBuilder:
-    """
-    This should never be instantiated by user code.
-
-    This is used by the RunBuilder.
-    """
-
-    def __init__(
-        self,
-        *,
-        cache,
-        compose_descriptor,
-        name,
-        data,
-        data_keys,
-        time,
-        object_keys,
-        configuration,
-        hints,
-    ):
-        self._compose_descriptor = compose_descriptor
-        self._cache = cache
-        self._closed = False
-        if data_keys is None:
-            # Infer the data_keys from the data.
-            data_keys = {
-                k: {
-                    "source": "RunBuilder",
-                    "dtype": _infer_dtype(next(iter(v))),
-                    "shape": _infer_shape(v),
-                }
-                for k, v in data.items()
-            }
-        self._bundle = compose_descriptor(
-            name=name,
-            data_keys=data_keys,
-            time=time,
-            object_keys=object_keys,
-            configuration=configuration,
-            hints=hints,
-        )
-        self._cache.descriptor(self._bundle.descriptor_doc)
-        if data is not None:
-            self.add_data(data=data, time=time)
-
-    def update_configuration(self, name, configuration):
-        if self._closed:
-            raise event_model.EventModelRuntimeError("Run is closed.")
-        doc = self._bundle.descriptor_doc
-        self._bundle = self._compose_descriptor(
-            name=doc["name"],
-            data_keys=doc["data_keys"],
-            time=doc["time"],
-            object_keys=doc["object_keys"],
-            configuration=configuration,
-            hints=doc["hints"],
-        )
-        self._cache.descriptor(self._bundle.descriptor_doc)
-
-    def add_data(self, data, time=None, timestamps=None, seq_num=None, uid=None):
-        if self._closed:
-            raise event_model.EventModelRuntimeError("Run is closed.")
-        import time as time_module
-
-        len_ = len(data[next(iter(data))])
-        now = time_module.time()
-        if time is None:
-            time = [now] * len_
-        if timestamps is None:
-            timestamps = {k: [now] * len_ for k in data}
-        if seq_num is None:
-            seq_num = list(range(len_))
-        doc = self._bundle.compose_event_page(
-            time=time,
-            data=_normalize_dataframe_like(data),
-            timestamps=_normalize_dataframe_like(timestamps),
-            seq_num=seq_num,
-            uid=uid,
-        )
-        self._cache.event_page(doc)
-
-    def _close(self):
-        self._closed = True
 
 
 def _infer_dtype(obj):
@@ -588,7 +606,7 @@ class BlueskyEventStream:
         ds = _documents_to_xarray(
             start_doc=document_cache.start_doc,
             stop_doc=document_cache.stop_doc,
-            descriptor_docs=list(document_cache.descriptors.values()),
+            descriptor_docs=self._descriptors,
             get_event_pages=get_event_pages,
             filler=filler,
             get_resource=get_resource,
