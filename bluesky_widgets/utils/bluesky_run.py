@@ -87,7 +87,7 @@ class RunBuilder:
 
     Parameters
     ----------
-    metadata : dict
+    metadata : dict, optional
         This should include metadata about what will be done and any adminstrative info.
     uid : string, optional
         By default, a UUID4 is generated.
@@ -379,6 +379,47 @@ class RunBuilder:
         else:
             if not self.closed:
                 self.close()  # success
+
+
+def build_simple_run(
+    data, metadata=None, uid=None, time=None, exit_status="success", reason=""
+):
+    """
+    Build a simple run from a dataset.
+
+    By "simple", we mean it has a single "stream" of data and does not expose
+    some of the options available from the more advanced RunBuilder, such as
+    adding data incrementally or including configuration and more detailed
+    timestamps.
+
+    This function is suitable for consuming data that could be represented as a
+    single "spreadsheet" plus a dictionary of metadata.
+
+    Parameters
+    ----------
+    data : xarray.Dataset, pandas.DataFrame, or dict-of-arrays-or-lists, optional
+    metadata : dict, optional
+        This should include metadata about what will be done and any adminstrative info.
+    uid : string, optional
+        By default, a UUID4 is generated.
+    time : float, optional
+        POSIX epoch time. By default, the current time is used.
+    exit_status : {"success", "abort", "fail"}, optional
+    reason : string, optional
+
+    Returns
+    -------
+    BlueskyRun
+
+    Examples
+    --------
+
+    >>> build_simple_run({'x': [1, 2, 3], 'y': [4, 5, 6], metadata={'sample': 'Cu'})
+    """
+    with RunBuilder(metadata=metadata, uid=uid, time=time) as builder:
+        builder.add_stream("primary", data=data)
+        builder.close(exit_status=exit_status, reason=reason)
+    return builder.get_run()
 
 
 def _infer_dtype(obj):
