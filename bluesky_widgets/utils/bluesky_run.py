@@ -238,6 +238,9 @@ class RunBuilder(collections.abc.Mapping):
         time : float
             POSIX epoch time. By default, the current time is used.
         """
+        closed = self._cache.stop_doc is not None
+        if closed:
+            raise event_model.EventModelRuntimeError("Run is already closed.")
         doc = self._run_bundle.compose_stop(
             exit_status=exit_status, reason=reason, uid=uid, time=time
         )
@@ -265,11 +268,14 @@ class RunBuilder(collections.abc.Mapping):
         return self
 
     def __exit__(self, type, value, traceback):
+        closed = self._cache.stop_doc is not None
         if type is not None:
             reason = repr(value)
-            self.close(exit_status="fail", reason=reason)
+            if not closed:
+                self.close(exit_status="fail", reason=reason)
         else:
-            self.close()  # success
+            if not closed:
+                self.close()  # success
 
 
 class StreamBuilder:
