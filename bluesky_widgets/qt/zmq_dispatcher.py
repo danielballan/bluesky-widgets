@@ -61,6 +61,7 @@ class RemoteDispatcher(QObject):
         self._timer = QTimer(self)
         self._dispatcher = Dispatcher()
         self.subscribe = self._dispatcher.subscribe
+        self.unsubscribe = self._dispatcher.subscribe
         self._waiting_for_start = True
 
     def _receive_data(self):
